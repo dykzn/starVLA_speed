@@ -19,11 +19,13 @@ LIBERO_ENV_RESOLUTION = 256  # resolution used to render training data
 
 PROMPT_PREFIXES = {
     # Keep the neutral setting byte-for-byte compatible with the original
-    # task instruction. Positive and negative cues use the same template
-    # length so that only affective polarity changes.
+    # task instruction. The four ESC variants are separated by valence and
+    # arousal; all cues are prepended to the original task instruction.
     "neutral": "",
     "positive": "I am feeling calm and hopeful right now. ",
     "negative": "I am feeling sad and disappointed right now. ",
+    "pos_high": "I am feeling excited and optimistic right now. ",
+    "neg_high": "I am feeling tense and worried right now. ",
 }
 
 
@@ -79,8 +81,9 @@ class Args:
     post_process_action: bool = True
 
     job_name: str = "test"
-    prompt_variant: str = "neutral"  # neutral, positive, or negative
+    prompt_variant: str = "neutral"  # neutral, positive, negative, pos_high, or neg_high
     resume_manifest: str = ""  # JSON task->completed/success counts from an earlier run
+    noise_apply_interval: int = 1  # 1=every env step; 8=only before each 8-step action chunk
 
 
 def eval_libero(args: Args) -> None:
@@ -118,6 +121,20 @@ def eval_libero(args: Args) -> None:
         port=args.port,
         unnorm_key=args.unnorm_key,
     )
+    if args.noise_apply_interval < 1:
+        raise ValueError("noise_apply_interval must be >= 1")
+    logging.info(
+        "Noise apply interval: %d env steps (policy action chunk size: %d)",
+        args.noise_apply_interval,
+        client_model.action_chunk_size,
+    )
+    if args.noise_apply_interval > 1 and args.noise_apply_interval != client_model.action_chunk_size:
+        logging.warning(
+            "noise_apply_interval=%d does not match action_chunk_size=%d; "
+            "only use the fast setting when they are aligned",
+            args.noise_apply_interval,
+            client_model.action_chunk_size,
+        )
 
     # Optional task range/stride allows several independent clients to evaluate
     # disjoint task shards concurrently without changing the default behavior.
@@ -213,7 +230,15 @@ def eval_libero(args: Args) -> None:
                 # IMPORTANT: Do nothing for the first few timesteps because the simulator drops objects
                 # and we need to wait for them to fall
                 if t < args.num_steps_wait:
-                    obs, reward, done, info = env.step(LIBERO_DUMMY_ACTION)
+                    # Only the final stabilization observation is consumed by
+                    # the first policy request in fast mode.
+                    apply_noise = (
+                        args.noise_apply_interval == 1
+                        or t == args.num_steps_wait - 1
+                    )
+                    obs, reward, done, info = env.step(
+                        LIBERO_DUMMY_ACTION, apply_noise=apply_noise
+                    )
                     t += 1
                     continue
 
@@ -270,7 +295,16 @@ def eval_libero(args: Args) -> None:
 
                 # __import__("ipdb").set_trace()
                 # see ../robosuite/controllers/controller_factory.py
-                obs, reward, done, info = env.step(delta_action.tolist())
+                # The returned observation is consumed only when the next
+                # action chunk is requested.  Avoid running expensive visual
+                # corruption for the cached steps in between.
+                apply_noise = (
+                    args.noise_apply_interval == 1
+                    or (step + 1) % args.noise_apply_interval == 0
+                )
+                obs, reward, done, info = env.step(
+                    delta_action.tolist(), apply_noise=apply_noise
+                )
                 if done:
                     task_successes += 1
                     total_successes += 1

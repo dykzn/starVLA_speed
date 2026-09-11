@@ -25,6 +25,25 @@ from deployment.model_server.tools.websocket_policy_client import WebsocketClien
 from examples.SimplerEnv.eval_files.adaptive_ensemble import AdaptiveEnsembler
 
 
+def _as_uint8_image(image: np.ndarray) -> np.ndarray:
+    """Convert simulator images to the uint8 format expected by PIL/Qwen.
+
+    LIBERO-plus can return a float64 image when its optional ImageMagick/Wand
+    dependency is unavailable and a visual disturbance is enabled.  PIL
+    rejects HWC float64 arrays, while the policy input contract is uint8 in
+    the [0, 255] range.  Keep this conversion at the client boundary so both
+    the regular LIBERO and LIBERO-plus paths use the same robust handling.
+    """
+    arr = np.asarray(image)
+    if arr.dtype == np.uint8:
+        return np.ascontiguousarray(arr)
+
+    arr = np.nan_to_num(arr, nan=0.0, posinf=255.0, neginf=0.0)
+    if np.issubdtype(arr.dtype, np.floating) and arr.size and float(arr.max()) <= 1.0:
+        arr = arr * 255.0
+    return np.ascontiguousarray(np.clip(arr, 0, 255).astype(np.uint8))
+
+
 class ModelClient:
     def __init__(
         self,
@@ -141,7 +160,7 @@ class ModelClient:
             resized = []
             target_hw = self.image_size  # (H, W)
             for img in example["image"]:
-                arr = np.asarray(img)
+                arr = _as_uint8_image(img)
                 if arr.shape[:2] != target_hw:
                     arr = np.asarray(
                         Image.fromarray(arr).resize(
